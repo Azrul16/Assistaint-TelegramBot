@@ -7,7 +7,7 @@ import os
 import random
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from html import escape
 from pathlib import Path
 from typing import Any
@@ -28,6 +28,7 @@ ASSISTANT_DATA_FILE = DATA_DIR / "assistant_data.json"
 
 DEFAULT_TOPICS = ["flutter", "python", "django", "fastapi", "ai", "backend"]
 DEFAULT_JOB_KEYWORDS = ["flutter", "dart", "python", "django", "fastapi", "backend", "api"]
+DEFAULT_GROQ_MODEL = "llama-3.3-70b-versatile"
 NEWS_FEEDS = [
     "https://blog.python.org/feeds/posts/default",
     "https://www.djangoproject.com/rss/weblog/",
@@ -55,34 +56,8 @@ CODING_PROMPTS = [
 ]
 
 BOT_COMMANDS = [
-    BotCommand("start", "Show bot help"),
-    BotCommand("subscribe", "Enable daily reminder, example: /subscribe 09:00"),
-    BotCommand("unsubscribe", "Disable daily reminders"),
-    BotCommand("news", "Get latest tech news for your topics"),
-    BotCommand("brief", "Get an AI summary of the latest tech updates"),
-    BotCommand("ask", "Ask an AI coding question"),
-    BotCommand("jobs", "Show recent job opportunities"),
-    BotCommand("addtask", "Add a task, example: /addtask Finish API auth"),
-    BotCommand("tasks", "Show your open tasks"),
-    BotCommand("done", "Mark a task done, example: /done 2"),
-    BotCommand("schedule", "Add an event, example: /schedule 2026-04-25 18:30 | Client call"),
-    BotCommand("agenda", "Show today's agenda and upcoming schedule"),
-    BotCommand("note", "Save a quick note"),
-    BotCommand("notes", "Show your recent notes"),
-    BotCommand("setjobkeywords", "Set job keywords, example: /setjobkeywords flutter python"),
-    BotCommand("alerts", "Control live alerts, example: /alerts on"),
-    BotCommand("settopics", "Set your topics, example: /settopics flutter python"),
-    BotCommand("topics", "Show your current topics"),
-    BotCommand("status", "Show your reminder status"),
-]
-
-INTENT_EXAMPLES = [
-    "give me flutter news -> news",
-    "remind me tomorrow at 8 pm to practice django -> schedule_add",
-    "add task finish portfolio homepage -> task_add",
-    "show my tasks -> task_list",
-    "save note call recruiter next week -> note_add",
-    "what is my agenda today -> agenda",
+    BotCommand("start", "Start personal assistant"),
+    BotCommand("status", "Show assistant status"),
 ]
 
 
@@ -142,7 +117,7 @@ def load_config() -> tuple[str, ZoneInfo, str, str, str]:
     timezone_name = os.getenv("TIMEZONE", "Asia/Dhaka").strip()
     default_time = os.getenv("DEFAULT_REMINDER_TIME", "09:00").strip()
     groq_api_key = os.getenv("GROQ_API_KEY", "").strip()
-    groq_model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant").strip()
+    groq_model = os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL).strip()
     return token, ZoneInfo(timezone_name), default_time, groq_api_key, groq_model
 
 
@@ -300,7 +275,7 @@ def parse_reminder_time(value: str) -> time:
 
 def parse_schedule_input(value: str, timezone: ZoneInfo) -> tuple[datetime, str]:
     if "|" not in value:
-        raise ValueError("Use: /schedule YYYY-MM-DD HH:MM | title")
+        raise ValueError("Send the date, time, and title like: 2026-04-25 18:30 | Client call")
 
     when_text, title = [part.strip() for part in value.split("|", maxsplit=1)]
     if not title:
@@ -320,6 +295,80 @@ def parse_datetime_text(value: str, timezone: ZoneInfo) -> datetime:
     except ValueError as exc:
         raise ValueError("Datetime should look like 2026-04-25 18:30.") from exc
     return scheduled_for.replace(tzinfo=timezone)
+
+
+def parse_clock_time_text(value: str) -> str | None:
+    lowered = value.lower()
+    match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", lowered)
+    if match:
+        return f"{int(match.group(1)):02d}:{int(match.group(2)):02d}"
+
+    match = re.search(r"\b(?:at\s+)?(1[0-2]|0?[1-9])(?:\s*)(am|pm)\b", lowered)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    meridiem = match.group(2)
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    if meridiem == "am" and hour == 12:
+        hour = 0
+    return f"{hour:02d}:00"
+
+
+def parse_natural_datetime_text(value: str, timezone: ZoneInfo) -> str | None:
+    lowered = value.lower()
+    clock_text = parse_clock_time_text(value)
+    if not clock_text:
+        return None
+
+    date_match = re.search(r"\b(20\d{2}-\d{2}-\d{2})\b", lowered)
+    if date_match:
+        return f"{date_match.group(1)} {clock_text}"
+
+    today = now_in_timezone(timezone).date()
+    if "tomorrow" in lowered:
+        target_date = today + timedelta(days=1)
+    elif "today" in lowered:
+        target_date = today
+    else:
+        target_datetime = datetime.strptime(f"{today.isoformat()} {clock_text}", "%Y-%m-%d %H:%M").replace(tzinfo=timezone)
+        if target_datetime <= now_in_timezone(timezone):
+            target_date = today + timedelta(days=1)
+        else:
+            target_date = today
+
+    return f"{target_date.isoformat()} {clock_text}"
+
+
+def extract_after_keywords(text: str, patterns: list[str]) -> str:
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).strip(" .")
+    return ""
+
+
+def extract_task_id(text: str) -> int:
+    match = re.search(r"\b(?:task\s*)?#?(\d+)\b", text, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else 0
+
+
+def extract_reminder_title(text: str) -> str:
+    title = re.sub(r"\b(remind me|set a reminder|reminder|please)\b", "", text, flags=re.IGNORECASE)
+    title = re.sub(r"\b(today|tomorrow)\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\b20\d{2}-\d{2}-\d{2}\b", "", title)
+    title = re.sub(r"\bat\s+[01]?\d:[0-5]\d\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bat\s+(1[0-2]|0?[1-9])\s*(am|pm)\b", "", title, flags=re.IGNORECASE)
+    title = re.sub(r"\bto\s+", "", title, count=1, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" .")
+    return title or "Reminder"
+
+
+def extract_task_title(text: str) -> str:
+    title = re.sub(r"^(add\s+(a\s+)?)?task\s+", "", text, flags=re.IGNORECASE).strip()
+    title = re.sub(r"^to\s+", "", title, flags=re.IGNORECASE).strip()
+    return title
 
 
 def normalize_topics(topics: list[str]) -> list[str]:
@@ -342,24 +391,33 @@ def item_matches_topics(item: Any, topics: list[str]) -> bool:
     return any(topic.lower() in haystack for topic in topics)
 
 
+def get_item_published_at(item: Any) -> datetime | None:
+    published = getattr(item, "published_parsed", None) or getattr(item, "updated_parsed", None)
+    if not published:
+        return None
+    return datetime(*published[:6])
+
+
 def fetch_news(topics: list[str], limit: int = 6) -> list[tuple[str, str]]:
-    matches: list[tuple[str, str]] = []
+    matches: list[tuple[datetime, str, str]] = []
     seen_links: set[str] = set()
+    cutoff = datetime.utcnow() - timedelta(days=7)
 
     for feed_url in NEWS_FEEDS:
         parsed = feedparser.parse(feed_url)
-        for item in parsed.entries[:12]:
+        for item in parsed.entries[:20]:
             title = str(getattr(item, "title", "")).strip()
             link = str(getattr(item, "link", "")).strip()
+            published_at = get_item_published_at(item)
             if not title or not link or link in seen_links:
                 continue
+            if published_at is None or published_at < cutoff:
+                continue
             if item_matches_topics(item, topics):
-                matches.append((title, link))
+                matches.append((published_at, title, link))
                 seen_links.add(link)
-            if len(matches) >= limit:
-                return matches
-
-    return matches
+    matches.sort(key=lambda item: item[0], reverse=True)
+    return [(title, link) for _, title, link in matches[:limit]]
 
 
 async def fetch_news_async(topics: list[str], limit: int = 6) -> list[tuple[str, str]]:
@@ -410,6 +468,36 @@ def format_jobs(job_items: list[tuple[str, str, str]]) -> str:
     lines = ["<b>Job opportunities for you</b>"]
     for index, (title, link, source) in enumerate(job_items, start=1):
         lines.append(f'{index}. <a href="{escape(link)}">{escape(title)}</a> - {escape(source)}')
+    return "\n".join(lines)
+
+
+def compact_text(text: str, max_lines: int = 4, max_chars: int = 420) -> str:
+    cleaned = re.sub(r"\n{3,}", "\n\n", text.strip())
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    lines = [line.strip(" -*0123456789.").strip() for line in cleaned.splitlines() if line.strip()]
+    if not lines:
+        return ""
+
+    compact_lines: list[str] = []
+    for line in lines:
+        if line and line not in compact_lines:
+            compact_lines.append(line)
+        if len(compact_lines) >= max_lines:
+            break
+
+    compact = "\n".join(compact_lines)
+    if len(compact) > max_chars:
+        compact = compact[: max_chars - 3].rstrip() + "..."
+    return compact
+
+
+def format_short_news(news_items: list[tuple[str, str]], limit: int = 3) -> str:
+    if not news_items:
+        return "I could not find fresh matching headlines right now."
+
+    lines = ["<b>Quick tech news</b>"]
+    for title, link in news_items[:limit]:
+        lines.append(f'- <a href="{escape(link)}">{escape(title)}</a>')
     return "\n".join(lines)
 
 
@@ -496,7 +584,7 @@ async def parse_chat_intent(
     timezone: ZoneInfo,
 ) -> dict[str, Any] | None:
     groq_api_key: str = application.bot_data.get("groq_api_key", "")
-    groq_model: str = application.bot_data.get("groq_model", "llama-3.1-8b-instant")
+    groq_model: str = application.bot_data.get("groq_model", DEFAULT_GROQ_MODEL)
     if not groq_api_key:
         return None
 
@@ -509,11 +597,14 @@ async def parse_chat_intent(
         f"Timezone: {timezone.key}\n"
         f"Open tasks: {open_tasks or ['none']}\n"
         f"User message: {text}\n\n"
+        "The user may write casual, short, misspelled, or Bangla-English mixed text.\n"
+        "Infer the practical meaning, not just exact keywords.\n"
         "Choose the best intent and return JSON only with this shape:\n"
         '{'
-        '"intent":"news|brief|jobs|agenda|task_add|task_list|task_done|schedule_add|note_add|notes|status|topics_set|alerts_on|alerts_off|question|unknown",'
+        '"intent":"news|brief|jobs|agenda|task_add|task_list|task_done|schedule_add|note_add|notes|status|subscribe|unsubscribe|topics|topics_set|job_keywords_set|alerts_on|alerts_off|question|unknown",'
         '"title":"string or empty",'
         '"datetime":"YYYY-MM-DD HH:MM or empty",'
+        '"time":"HH:MM or empty",'
         '"task_id":0,'
         '"topics":["topic"],'
         '"question":"string or empty",'
@@ -522,44 +613,96 @@ async def parse_chat_intent(
         "Rules:\n"
         "- For reminder or meeting requests, use schedule_add and convert relative dates like tomorrow into exact datetime.\n"
         "- For schedule_add, put the reminder text in title.\n"
+        "- If a message asks to remember something at a time, prefer schedule_add over jobs/news even if the title mentions jobs or news.\n"
+        "- For daily reminder subscription requests, use subscribe and put the daily time in time.\n"
+        "- For stopping daily reminders, use unsubscribe.\n"
         "- For task requests, extract a short task title.\n"
+        "- For requests to mark tasks done, use task_done and extract task_id.\n"
         "- For direct coding or productivity questions, use question.\n"
         "- For requests to see updates or headlines, use news or brief.\n"
+        "- For topic or job keyword updates, fill topics.\n"
         "- For requests to save thoughts, use note_add.\n"
-        "- If uncertain, use unknown.\n"
-        f"Examples: {INTENT_EXAMPLES}"
+        "- If the user is asking the assistant to do something, choose the closest action instead of question.\n"
+        "- Use question only for advice, explanations, coding help, or general chat.\n"
+        "- If truly uncertain, use unknown."
     )
 
     raw = await generate_groq_text(
         groq_api_key,
         groq_model,
-        "You are a strict intent parser for a Telegram personal assistant. Return JSON only.",
+        "You are a careful intent parser for a Telegram personal assistant. Understand casual and mixed-language chat. Return JSON only.",
         prompt,
         max_completion_tokens=220,
     )
     return extract_json_object(raw) if raw else None
 
 
-def fallback_intent(text: str) -> dict[str, Any]:
+def fallback_intent(text: str, timezone: ZoneInfo) -> dict[str, Any]:
     lowered = text.lower().strip()
+    if any(phrase in lowered for phrase in ["stop daily reminder", "pause daily reminder", "unsubscribe"]):
+        return {"intent": "unsubscribe"}
+    if any(phrase in lowered for phrase in ["daily reminder", "subscribe", "check in every day", "every day at"]):
+        return {"intent": "subscribe", "time": parse_clock_time_text(text) or ""}
+    if "alerts on" in lowered or "turn alerts on" in lowered or "enable alerts" in lowered:
+        return {"intent": "alerts_on"}
+    if "alerts off" in lowered or "turn alerts off" in lowered or "disable alerts" in lowered:
+        return {"intent": "alerts_off"}
+
+    job_keywords = extract_after_keywords(
+        text,
+        [
+            r"\bset\s+job\s+keywords(?:\s+to)?\s+(.+)$",
+            r"\bjob\s+keywords(?:\s+are|\s+to)?\s+(.+)$",
+        ],
+    )
+    if job_keywords:
+        return {"intent": "job_keywords_set", "topics": normalize_topics(job_keywords.split())}
+
+    topics_text = extract_after_keywords(
+        text,
+        [
+            r"\bset\s+(?:my\s+)?topics(?:\s+to)?\s+(.+)$",
+            r"\b(?:my\s+)?topics(?:\s+are|\s+to)?\s+(.+)$",
+        ],
+    )
+    if topics_text:
+        return {"intent": "topics_set", "topics": normalize_topics(topics_text.split())}
+
+    if any(phrase in lowered for phrase in ["my topics", "show topics", "current topics", "what topics"]):
+        return {"intent": "topics"}
+
+    if any(word in lowered for word in ["remind", "reminder"]):
+        return {
+            "intent": "schedule_add",
+            "title": extract_reminder_title(text),
+            "datetime": parse_natural_datetime_text(text, timezone) or "",
+        }
+
     if any(word in lowered for word in ["news", "headline", "update"]):
         return {"intent": "news"}
+    if any(word in lowered for word in ["brief", "summary", "summarize"]):
+        return {"intent": "brief"}
     if any(word in lowered for word in ["job", "vacancy", "hiring", "opportunity", "openings"]):
         return {"intent": "jobs"}
     if any(word in lowered for word in ["agenda", "schedule today", "what do i have", "today plan"]):
         return {"intent": "agenda"}
-    if "alerts on" in lowered:
-        return {"intent": "alerts_on"}
-    if "alerts off" in lowered:
-        return {"intent": "alerts_off"}
-    if any(word in lowered for word in ["show tasks", "my tasks", "task list"]):
+    if any(word in lowered for word in ["status", "settings", "reminder status"]):
+        return {"intent": "status"}
+    if any(phrase in lowered for phrase in ["show notes", "my notes", "saved notes"]):
+        return {"intent": "notes"}
+    if any(word in lowered for word in ["show tasks", "my tasks", "task list", "open tasks"]):
         return {"intent": "task_list"}
-    if lowered.startswith("note ") or lowered.startswith("save note "):
-        note_text = re.sub(r"^(save\s+)?note\s+", "", text, flags=re.IGNORECASE).strip()
+
+    if any(phrase in lowered for phrase in ["mark task", "task done", "done task", "finish task", "complete task"]):
+        return {"intent": "task_done", "task_id": extract_task_id(text)}
+
+    if lowered.startswith("note ") or lowered.startswith("save note ") or lowered.startswith("save a note "):
+        note_text = re.sub(r"^(save\s+(a\s+)?)?note\s+", "", text, flags=re.IGNORECASE).strip()
         return {"intent": "note_add", "title": note_text}
-    if lowered.startswith("add task ") or lowered.startswith("task "):
-        title = re.sub(r"^(add\s+)?task\s+", "", text, flags=re.IGNORECASE).strip()
-        return {"intent": "task_add", "title": title}
+
+    if lowered.startswith("add task ") or lowered.startswith("add a task ") or lowered.startswith("task "):
+        return {"intent": "task_add", "title": extract_task_title(text)}
+
     return {"intent": "question", "question": text}
 
 
@@ -569,29 +712,32 @@ async def build_ai_news_brief(
     news_items: list[tuple[str, str]],
 ) -> str | None:
     groq_api_key: str = application.bot_data.get("groq_api_key", "")
-    groq_model: str = application.bot_data.get("groq_model", "llama-3.1-8b-instant")
+    groq_model: str = application.bot_data.get("groq_model", DEFAULT_GROQ_MODEL)
     if not groq_api_key or not news_items:
         return None
 
     headlines = "\n".join(f"- {title} ({link})" for title, link in news_items[:5])
     prompt = (
         f"Topics: {', '.join(topics)}\n"
-        "Summarize the most relevant points from these headlines for a software developer. "
-        "Keep it short, practical, and motivating.\n\n"
+        "Summarize the most relevant points from these headlines for a software developer.\n"
+        "Return exactly 3 short bullet points.\n"
+        "Each bullet must be one sentence and under 18 words.\n"
+        "No intro, no outro, no numbering.\n\n"
         f"{headlines}"
     )
-    return await generate_groq_text(
+    response = await generate_groq_text(
         groq_api_key,
         groq_model,
-        "You are a concise developer news assistant. Focus on why the update matters to the reader's work.",
+        "You are a concise developer news assistant. Be brief, concrete, and compact.",
         prompt,
-        max_completion_tokens=220,
+        max_completion_tokens=120,
     )
+    return compact_text(response or "", max_lines=3, max_chars=240) or None
 
 
 async def build_ai_agenda_brief(application: Application, profile: AssistantProfile, timezone: ZoneInfo) -> str | None:
     groq_api_key: str = application.bot_data.get("groq_api_key", "")
-    groq_model: str = application.bot_data.get("groq_model", "llama-3.1-8b-instant")
+    groq_model: str = application.bot_data.get("groq_model", DEFAULT_GROQ_MODEL)
     if not groq_api_key:
         return None
 
@@ -623,7 +769,7 @@ async def build_ai_agenda_brief(application: Application, profile: AssistantProf
 
 
 def format_ai_brief(text: str) -> str:
-    return f"<b>Why this matters today</b>\n{escape(text)}"
+    return f"<b>Why this matters today</b>\n{escape(compact_text(text, max_lines=3, max_chars=240))}"
 
 
 def build_prompt_order(chat_id: int, previous_last: int | None = None) -> list[int]:
@@ -652,7 +798,7 @@ def get_next_prompt(subscriber: Subscriber) -> str:
 def format_tasks(profile: AssistantProfile) -> str:
     open_tasks = [task for task in profile.tasks if not task.done]
     if not open_tasks:
-        return "No open tasks right now. Add one with /addtask."
+        return "No open tasks right now. Tell me what you want to add."
 
     lines = ["<b>Your tasks</b>"]
     for task in open_tasks[:15]:
@@ -662,7 +808,7 @@ def format_tasks(profile: AssistantProfile) -> str:
 
 def format_notes(profile: AssistantProfile) -> str:
     if not profile.notes:
-        return "No notes saved yet. Use /note to save one."
+        return "No notes saved yet. Tell me what you want to remember."
 
     lines = ["<b>Recent notes</b>"]
     for note in sorted(profile.notes, key=lambda item: item.created_at, reverse=True)[:10]:
@@ -849,20 +995,8 @@ def schedule_subscriber(application: Application, subscriber: Subscriber, timezo
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Hi, I am your personal assistant bot.\n\n"
-        "Core commands:\n"
-        "/subscribe 09:00 - daily coding reminder, agenda, and news\n"
-        "/addtask Finish onboarding screen\n"
-        "/tasks\n"
-        "/done 1\n"
-        "/schedule 2026-04-25 18:30 | Client call\n"
-        "/agenda\n"
-        "/note Ask recruiter about timeline\n"
-        "/notes\n"
-        "/brief - AI summary of fresh tech updates\n"
-        "/ask How do I structure a FastAPI project?\n"
-        "/settopics flutter python django fastapi\n"
-        "/status"
+        "Hi, I am your personal assistant.\n\n"
+        "Just message me naturally. I can understand your intent, manage reminders, tasks, notes, agenda, tech news, jobs, alerts, and coding questions."
     )
 
 
@@ -910,10 +1044,10 @@ async def news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     subscribers: dict[str, Subscriber] = context.application.bot_data["subscribers"]
     chat_id = str(update.effective_chat.id)
     topics = subscribers.get(chat_id, Subscriber(int(chat_id), "09:00")).topics
-    news_items = await fetch_news_async(topics)
+    news_items = await fetch_news_async(topics, limit=3)
 
     await update.message.reply_text(
-        format_news(news_items),
+        format_short_news(news_items),
         parse_mode=ParseMode.HTML,
         disable_web_page_preview=True,
     )
@@ -957,11 +1091,11 @@ async def jobs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     question = " ".join(context.args).strip()
     if not question:
-        await update.message.reply_text("Ask something like: /ask How should I structure a Django app?")
+        await update.message.reply_text("Ask me any coding or productivity question in normal text.")
         return
 
     groq_api_key: str = context.application.bot_data.get("groq_api_key", "")
-    groq_model: str = context.application.bot_data.get("groq_model", "llama-3.1-8b-instant")
+    groq_model: str = context.application.bot_data.get("groq_model", DEFAULT_GROQ_MODEL)
     if not groq_api_key:
         await update.message.reply_text("AI mode is not configured yet. Add GROQ_API_KEY to .env and restart the bot.")
         return
@@ -985,7 +1119,7 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def answer_question_text(application: Application, question: str) -> str:
     groq_api_key: str = application.bot_data.get("groq_api_key", "")
-    groq_model: str = application.bot_data.get("groq_model", "llama-3.1-8b-instant")
+    groq_model: str = application.bot_data.get("groq_model", DEFAULT_GROQ_MODEL)
     if not groq_api_key:
         return "AI mode is not configured yet. Add GROQ_API_KEY to .env and restart the bot."
 
@@ -994,20 +1128,22 @@ async def answer_question_text(application: Application, question: str) -> str:
         groq_model,
         (
             "You are a helpful coding and productivity assistant for a developer working with Flutter, Python, Django, FastAPI, and backend engineering. "
-            "Give practical, concise answers with direct advice."
+            "Reply in at most 4 short bullets or 1 very short paragraph. "
+            "Keep it under 320 characters when the user asks for news or updates. "
+            "Avoid long lists unless explicitly requested."
         ),
         question,
-        max_completion_tokens=350,
+        max_completion_tokens=140,
     )
     if not answer:
         return "I could not reach the AI service right now. Please try again in a moment."
-    return answer
+    return compact_text(answer, max_lines=4, max_chars=320)
 
 
 async def add_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     title = " ".join(context.args).strip()
     if not title:
-        await update.message.reply_text("Use: /addtask Finish portfolio landing page")
+        await update.message.reply_text("Tell me the task you want to add.")
         return
 
     timezone: ZoneInfo = context.application.bot_data["timezone"]
@@ -1030,7 +1166,7 @@ async def list_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def complete_task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Use: /done 2")
+        await update.message.reply_text("Tell me which task number is done.")
         return
 
     try:
@@ -1057,7 +1193,7 @@ async def add_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     text = " ".join(context.args).strip()
     timezone: ZoneInfo = context.application.bot_data["timezone"]
     if not text:
-        await update.message.reply_text("Use: /schedule 2026-04-25 18:30 | Client call")
+        await update.message.reply_text("Tell me what to schedule and when.")
         return
 
     try:
@@ -1093,7 +1229,7 @@ async def agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def add_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = " ".join(context.args).strip()
     if not text:
-        await update.message.reply_text("Use: /note Follow up on deployment issue tomorrow")
+        await update.message.reply_text("Tell me the note you want me to save.")
         return
 
     timezone: ZoneInfo = context.application.bot_data["timezone"]
@@ -1116,7 +1252,7 @@ async def list_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def set_job_keywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Send job keywords like: /setjobkeywords flutter dart python backend")
+        await update.message.reply_text("Tell me the job keywords you want me to track.")
         return
 
     profiles: dict[str, AssistantProfile] = context.application.bot_data["assistant_profiles"]
@@ -1155,7 +1291,7 @@ async def alerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def set_topics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Send topics like: /settopics flutter python django fastapi")
+        await update.message.reply_text("Tell me the topics you want me to track.")
         return
 
     subscribers: dict[str, Subscriber] = context.application.bot_data["subscribers"]
@@ -1216,20 +1352,27 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
     profile = get_profile(context.application, chat_id)
 
     parsed = await parse_chat_intent(context.application, chat_id, text, timezone)
-    intent_data = parsed or fallback_intent(text)
+    intent_data = parsed or fallback_intent(text, timezone)
     intent = str(intent_data.get("intent", "unknown")).strip().lower()
+    if intent == "unknown":
+        intent_data = fallback_intent(text, timezone)
+        intent = str(intent_data.get("intent", "unknown")).strip().lower()
 
     if intent == "news":
         topics_list = subscribers.get(str(chat_id), Subscriber(chat_id, "09:00")).topics
-        news_items = await fetch_news_async(topics_list)
-        await message.reply_text(format_news(news_items), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        news_items = await fetch_news_async(topics_list, limit=3)
+        await message.reply_text(
+            format_short_news(news_items),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
         return
 
     if intent == "brief":
         topics_list = subscribers.get(str(chat_id), Subscriber(chat_id, "09:00")).topics
-        news_items = await fetch_news_async(topics_list, limit=5)
+        news_items = await fetch_news_async(topics_list, limit=3)
         ai_brief = await build_ai_news_brief(context.application, topics_list, news_items)
-        response = f"{format_ai_brief(ai_brief)}\n\n{format_news(news_items)}" if ai_brief else format_news(news_items)
+        response = f"{format_ai_brief(ai_brief)}\n\n{format_short_news(news_items)}" if ai_brief else format_short_news(news_items)
         await message.reply_text(response, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
         return
 
@@ -1256,6 +1399,7 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             or str(intent_data.get("question", "")).strip()
             or text
         )
+        title = re.sub(r"^to\s+", "", title, flags=re.IGNORECASE).strip()
         task = TaskItem(
             id=next_id(profile.tasks),
             title=title,
@@ -1330,6 +1474,46 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await message.reply_text(format_notes(profile), parse_mode=ParseMode.HTML)
         return
 
+    if intent == "topics":
+        subscriber = subscribers.get(str(chat_id), Subscriber(chat_id, "09:00"))
+        await message.reply_text("Your topics: " + ", ".join(subscriber.topics))
+        return
+
+    if intent == "subscribe":
+        requested_time = (
+            str(intent_data.get("time", "")).strip()
+            or parse_clock_time_text(text)
+            or context.application.bot_data["default_time"]
+        )
+        requested_time = parse_clock_time_text(requested_time) or requested_time
+        try:
+            parse_reminder_time(requested_time)
+        except ValueError:
+            await message.reply_text("I can turn daily reminders on, but I need a time like 09:00 or 8 pm.")
+            return
+
+        existing = subscribers.get(str(chat_id))
+        subscriber = Subscriber(
+            chat_id=chat_id,
+            reminder_time=requested_time,
+            topics=existing.topics if existing else DEFAULT_TOPICS.copy(),
+            prompt_order=existing.prompt_order if existing else [],
+            prompt_position=existing.prompt_position if existing else 0,
+        )
+        subscribers[str(chat_id)] = subscriber
+        write_subscribers(subscribers)
+        schedule_subscriber(context.application, subscriber, timezone)
+        await message.reply_text(f"Daily reminders are on at {requested_time}.")
+        return
+
+    if intent == "unsubscribe":
+        subscribers.pop(str(chat_id), None)
+        write_subscribers(subscribers)
+        for job in context.application.job_queue.get_jobs_by_name(str(chat_id)):
+            job.schedule_removal()
+        await message.reply_text("Daily reminders are paused.")
+        return
+
     if intent == "topics_set":
         topics_values = intent_data.get("topics", [])
         if isinstance(topics_values, list):
@@ -1342,6 +1526,17 @@ async def handle_chat_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         write_subscribers(subscribers)
         schedule_subscriber(context.application, subscriber, timezone)
         await message.reply_text("Topics updated: " + ", ".join(subscriber.topics))
+        return
+
+    if intent == "job_keywords_set":
+        topics_values = intent_data.get("topics", [])
+        if isinstance(topics_values, list):
+            profile.job_keywords = normalize_topics([str(item) for item in topics_values])
+        else:
+            profile.job_keywords = DEFAULT_JOB_KEYWORDS.copy()
+        profile.seen_job_links = []
+        write_assistant_profiles(profiles)
+        await message.reply_text("Job keywords updated: " + ", ".join(profile.job_keywords))
         return
 
     if intent == "alerts_on":
@@ -1397,23 +1592,6 @@ def build_application() -> Application:
     application.bot_data["groq_model"] = groq_model
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("subscribe", subscribe))
-    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    application.add_handler(CommandHandler("news", news))
-    application.add_handler(CommandHandler("brief", brief))
-    application.add_handler(CommandHandler("ask", ask))
-    application.add_handler(CommandHandler("jobs", jobs))
-    application.add_handler(CommandHandler("addtask", add_task))
-    application.add_handler(CommandHandler("tasks", list_tasks))
-    application.add_handler(CommandHandler("done", complete_task))
-    application.add_handler(CommandHandler("schedule", add_schedule))
-    application.add_handler(CommandHandler("agenda", agenda))
-    application.add_handler(CommandHandler("note", add_note))
-    application.add_handler(CommandHandler("notes", list_notes))
-    application.add_handler(CommandHandler("setjobkeywords", set_job_keywords))
-    application.add_handler(CommandHandler("alerts", alerts))
-    application.add_handler(CommandHandler("settopics", set_topics))
-    application.add_handler(CommandHandler("topics", topics))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_chat_message))
 
